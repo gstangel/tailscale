@@ -24,6 +24,7 @@ import (
 	"golang.org/x/net/ipv6"
 	"tailscale.com/disco"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/nat64"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/tstun"
@@ -1544,20 +1545,29 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 	}
 
 	var newIpps []netip.AddrPort
+	nat64Prefix, haveNAT64 := de.c.currentNAT64Prefix()
 	for i, ipp := range eps.All() {
 		if i > math.MaxInt16 {
 			// Seems unlikely.
 			break
 		}
-		if !ipp.IsValid() {
-			de.c.logf("magicsock: bogus netmap endpoint from %v", eps)
-			continue
+		add := func(ipp netip.AddrPort) {
+			if !ipp.IsValid() {
+				de.c.logf("magicsock: bogus netmap endpoint from %v", eps)
+				return
+			}
+			if st, ok := de.endpointState[ipp]; ok {
+				st.index = int16(i)
+			} else {
+				de.endpointState[ipp] = &endpointState{index: int16(i)}
+				newIpps = append(newIpps, ipp)
+			}
 		}
-		if st, ok := de.endpointState[ipp]; ok {
-			st.index = int16(i)
-		} else {
-			de.endpointState[ipp] = &endpointState{index: int16(i)}
-			newIpps = append(newIpps, ipp)
+		add(ipp)
+		if haveNAT64 && ipp.Addr().Is4() {
+			if synth, ok := nat64.Synthesize(nat64Prefix, ipp.Addr()); ok {
+				add(netip.AddrPortFrom(synth, ipp.Port()))
+			}
 		}
 	}
 	if len(newIpps) > 0 {

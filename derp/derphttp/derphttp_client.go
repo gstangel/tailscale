@@ -36,6 +36,7 @@ import (
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/nat64"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/netx"
@@ -297,6 +298,10 @@ type AddressFamilySelector interface {
 	PreferIPv6() bool
 }
 
+type nat64PrefixProvider interface {
+	NAT64Prefix() (netip.Prefix, bool)
+}
+
 // SetAddressFamilySelector sets the AddressFamilySelector that this
 // connection will use. It should be called before any dials.
 // The value must not be nil. If called more than once, s must
@@ -310,6 +315,15 @@ func (c *Client) preferIPv6() bool {
 		return s.PreferIPv6()
 	}
 	return false
+}
+
+func (c *Client) nat64Prefix() (_ netip.Prefix, ok bool) {
+	if s, ok := c.addrFamSelAtomic.Load().(AddressFamilySelector); ok {
+		if p, ok := s.(nat64PrefixProvider); ok {
+			return p.NAT64Prefix()
+		}
+	}
+	return netip.Prefix{}, false
 }
 
 // dialWebsocketFunc is non-nil (set by websocket.go's init) when compiled in.
@@ -754,8 +768,9 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
 
 	nwait := 0
-	startDial := func(dstPrimary, proto string) {
-		dst := cmp.Or(dstPrimary, n.HostName)
+	startDial := func(t dialTarget) {
+		dst := cmp.Or(t.addr, n.HostName)
+		proto := t.proto
 
 		// If dialing an IP address directly, check its address family
 		// and bail out before incrementing nwait.
@@ -797,11 +812,13 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			}
 		}()
 	}
-	if shouldDialProto(n.IPv4, netip.Addr.Is4) {
-		startDial(n.IPv4, "tcp4")
-	}
-	if shouldDialProto(n.IPv6, netip.Addr.Is6) {
-		startDial(n.IPv6, "tcp6")
+	nat64Prefix, haveNAT64 := c.nat64Prefix()
+	for _, t := range dialTargets(n, nat64Prefix, haveNAT64) {
+		if t.addr == "" || shouldDialProto(t.addr, func(ip netip.Addr) bool {
+			return (t.proto == "tcp4" && ip.Is4()) || (t.proto == "tcp6" && ip.Is6())
+		}) {
+			startDial(t)
+		}
 	}
 	if nwait == 0 {
 		return nil, errors.New("both IPv4 and IPv6 are explicitly disabled for node")
@@ -825,6 +842,29 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			return nil, ctx.Err()
 		}
 	}
+}
+
+type dialTarget struct {
+	addr  string
+	proto string
+}
+
+func dialTargets(n *tailcfg.DERPNode, nat64Prefix netip.Prefix, haveNAT64 bool) []dialTarget {
+	var ret []dialTarget
+	if shouldDialProto(n.IPv4, netip.Addr.Is4) {
+		ret = append(ret, dialTarget{addr: n.IPv4, proto: "tcp4"})
+		if haveNAT64 {
+			if ip, err := netip.ParseAddr(n.IPv4); err == nil && ip.Is4() {
+				if synth, ok := nat64.Synthesize(nat64Prefix, ip); ok {
+					ret = append(ret, dialTarget{addr: synth.String(), proto: "tcp6"})
+				}
+			}
+		}
+	}
+	if shouldDialProto(n.IPv6, netip.Addr.Is6) {
+		ret = append(ret, dialTarget{addr: n.IPv6, proto: "tcp6"})
+	}
+	return ret
 }
 
 func firstStr(a, b string) string {

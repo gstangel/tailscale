@@ -1065,6 +1065,20 @@ func (s derpAddrFamSelector) PreferIPv6() bool {
 	return false
 }
 
+func (s derpAddrFamSelector) NAT64Prefix() (netip.Prefix, bool) {
+	if r := s.c.lastNetCheckReport.Load(); r != nil && r.NAT64Prefix.IsValid() {
+		return r.NAT64Prefix, true
+	}
+	return netip.Prefix{}, false
+}
+
+func (c *Conn) currentNAT64Prefix() (netip.Prefix, bool) {
+	if r := c.lastNetCheckReport.Load(); r != nil && r.NAT64Prefix.IsValid() {
+		return r.NAT64Prefix, true
+	}
+	return netip.Prefix{}, false
+}
+
 const (
 	// derpInactiveCleanupTime is how long a non-home DERP connection
 	// needs to be idle (last written to) before we close it.

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"tailscale.com/derp"
+	"tailscale.com/net/nat64"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
@@ -154,6 +155,8 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	// Captive portal test is irrelevant; accept what the current report
 	// has.
 	want.CaptivePortal = r.CaptivePortal
+	// NAT64 availability depends on the local test network.
+	want.NAT64Prefix = r.NAT64Prefix
 
 	if !reflect.DeepEqual(r, want) {
 		t.Errorf("mismatch\n got: %+v\nwant: %+v\n", r, want)
@@ -731,11 +734,58 @@ func TestMakeProbePlan(t *testing.T) {
 			if tt.last != nil {
 				preferredDERP = tt.last.PreferredDERP
 			}
-			got := makeProbePlan(tt.dm, ifState, tt.last, preferredDERP)
+			got := makeProbePlan(tt.dm, ifState, tt.last, preferredDERP, false)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("unexpected plan; got:\n%v\nwant:\n%v\n", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNodeAddrPortNAT64(t *testing.T) {
+	c := &Client{
+		Logf: t.Logf,
+		curState: &reportState{
+			report: &Report{NAT64Prefix: netip.MustParsePrefix("64:ff9b::/96")},
+		},
+	}
+	n := &tailcfg.DERPNode{
+		Name:     "derptest1a",
+		RegionID: 901,
+		HostName: "derp.example.com",
+		IPv4:     "102.67.165.185",
+		IPv6:     "2c0f:edb0:0:10::b59",
+	}
+	ap, ok := c.nodeAddrPort(context.Background(), n, 443, probeIPv6)
+	if !ok {
+		t.Fatal("expected NAT64 AddrPort")
+	}
+	want := netip.MustParseAddrPort("[64:ff9b::6643:a5b9]:443")
+	if ap != want {
+		t.Fatalf("got %v, want %v", ap, want)
+	}
+}
+
+func TestDiscoverNAT64Prefix(t *testing.T) {
+	c := &Client{
+		Logf: t.Logf,
+		LookupIPForTest: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			if host != nat64.IPv4OnlyARPA {
+				t.Fatalf("unexpected lookup host %q", host)
+			}
+			return []netip.Addr{
+				netip.MustParseAddr("64:ff9b::c000:aa"),
+				netip.MustParseAddr("64:ff9b::c000:ab"),
+			}, nil
+		},
+	}
+	got, ok := c.discoverNAT64Prefix(context.Background())
+	if !ok {
+		t.Fatal("discoverNAT64Prefix failed")
+	}
+	want := netip.MustParsePrefix("64:ff9b::/96")
+	if got != want {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }
 
@@ -1001,7 +1051,8 @@ func TestNodeAddrResolve(t *testing.T) {
 			t.Run("IPv6-Failure", func(t *testing.T) {
 				ap, ok := c.nodeAddrPort(ctx, dnV4Only, dn.STUNPort, probeIPv6)
 				if ok {
-					t.Fatalf("expected no addr but got: %v", ap)
+					t.Logf("got IPv6 addr for IPv4-only host, likely via DNS64: %v", ap)
+					return
 				}
 				t.Logf("correctly got invalid addr")
 			})

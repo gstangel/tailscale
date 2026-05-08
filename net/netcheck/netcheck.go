@@ -30,6 +30,7 @@ import (
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/hostinfo"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/nat64"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -120,6 +121,11 @@ type Report struct {
 
 	GlobalV4 netip.AddrPort
 	GlobalV6 netip.AddrPort
+
+	// NAT64Prefix is the IPv6 prefix discovered via DNS64, if any.
+	// It can be used to synthesize IPv6 addresses from IPv4 literals
+	// exchanged outside DNS.
+	NAT64Prefix netip.Prefix
 
 	// CaptivePortal is set when we think there's a captive portal that is
 	// intercepting HTTP traffic.
@@ -226,6 +232,10 @@ type Client struct {
 	//
 	// If false, the default net.Resolver will be used, with no caching.
 	UseDNSCache bool
+
+	// LookupIPForTest, if non-nil, is used instead of the host resolver for
+	// NAT64 prefix discovery and DERP hostname fallback resolution.
+	LookupIPForTest func(ctx context.Context, host string) ([]netip.Addr, error)
 
 	// if non-zero, force this DERP region to be preferred in all reports where
 	// the DERP is found to be reachable.
@@ -431,9 +441,9 @@ const numIncrementalRegions = 3
 // TODO(raggi): change from "preferred DERP" from a historical report to "home
 // DERP" as in what DERP is the current home connection, this would further
 // reduce flap events.
-func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, preferredDERP int) (plan probePlan) {
+func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, preferredDERP int, haveNAT64 bool) (plan probePlan) {
 	if last == nil || len(last.RegionLatency) == 0 {
-		return makeProbePlanInitial(dm, ifState)
+		return makeProbePlanInitial(dm, ifState, haveNAT64)
 	}
 	have6if := ifState.HaveV6
 	have4if := ifState.HaveV4
@@ -521,7 +531,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, pre
 			if n.IPv4 != "none" && (do4 || n.IsTestNode()) {
 				p4 = append(p4, probe{delay: delay, node: n.Name, proto: probeIPv4})
 			}
-			if n.IPv6 != "none" && (do6 || n.IsTestNode()) {
+			if nodeHasIPv6Candidate(n, haveNAT64) && (do6 || n.IsTestNode()) {
 				p6 = append(p6, probe{delay: delay, node: n.Name, proto: probeIPv6})
 			}
 		}
@@ -535,7 +545,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, pre
 	return plan
 }
 
-func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan probePlan) {
+func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State, haveNAT64 bool) (plan probePlan) {
 	plan = make(probePlan)
 
 	for _, reg := range dm.Regions {
@@ -551,7 +561,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 			if n.IPv4 != "none" && ((ifState.HaveV4 && nodeMight4(n)) || n.IsTestNode()) {
 				p4 = append(p4, probe{delay: delay, node: n.Name, proto: probeIPv4})
 			}
-			if n.IPv6 != "none" && ((ifState.HaveV6 && nodeMight6(n)) || n.IsTestNode()) {
+			if nodeHasIPv6Candidate(n, haveNAT64) && ((ifState.HaveV6 && nodeMight6(n, haveNAT64)) || n.IsTestNode()) {
 				p6 = append(p6, probe{delay: delay, node: n.Name, proto: probeIPv6})
 			}
 		}
@@ -565,10 +575,17 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 	return plan
 }
 
+func nodeHasIPv6Candidate(n *tailcfg.DERPNode, haveNAT64 bool) bool {
+	return n.IPv6 != "none" || (haveNAT64 && n.IPv4 != "none")
+}
+
 // nodeMight6 reports whether n might reply to STUN over IPv6 based on
 // its config alone, without DNS lookups. It only returns false if
 // it's not explicitly disabled.
-func nodeMight6(n *tailcfg.DERPNode) bool {
+func nodeMight6(n *tailcfg.DERPNode, haveNAT64 bool) bool {
+	if haveNAT64 && n.IPv4 != "none" && nodeMight4(n) {
+		return true
+	}
 	if n.IPv6 == "" {
 		return true
 	}
@@ -898,6 +915,12 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		v6udp.Close()
 	}
 
+	if !c.SkipExternalNetwork && rs.report.OSHasIPv6 {
+		if p, ok := c.discoverNAT64Prefix(ctx); ok {
+			rs.report.NAT64Prefix = p
+		}
+	}
+
 	if !c.SkipExternalNetwork && c.PortMapper != nil {
 		rs.waitPortMap.Add(1)
 		go rs.probePortMapServices()
@@ -905,7 +928,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 
 	var plan probePlan
 	if opts == nil || !opts.OnlyTCP443 {
-		plan = makeProbePlan(dm, ifState, last, preferredDERP)
+		plan = makeProbePlan(dm, ifState, last, preferredDERP, rs.report.NAT64Prefix.IsValid())
 	}
 
 	// If we're doing a full probe, also check for a captive portal. We
@@ -987,7 +1010,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		for _, reg := range need {
 			go func(reg *tailcfg.DERPRegion) {
 				defer wg.Done()
-				if d, ip, err := c.measureHTTPSLatency(ctx, reg); err != nil {
+				if d, ip, err := c.measureHTTPSLatency(ctx, rs, reg); err != nil {
 					c.logf("[v1] netcheck: measuring HTTPS latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
 				} else {
 					rs.mu.Lock()
@@ -1103,7 +1126,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 
 // measureHTTPSLatency measures HTTP request latency to the DERP region, but
 // only returns success if an HTTPS request to the region succeeds.
-func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegion) (time.Duration, netip.Addr, error) {
+func (c *Client) measureHTTPSLatency(ctx context.Context, rs *reportState, reg *tailcfg.DERPRegion) (time.Duration, netip.Addr, error) {
 	metricHTTPSend.Add(1)
 	ctx, cancel := context.WithTimeout(ctx, httpsProbeTimeout)
 	defer cancel()
@@ -1111,6 +1134,7 @@ func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegio
 	var ip netip.Addr
 
 	dc := derphttp.NewNetcheckClient(c.logf, c.NetMon)
+	dc.SetAddressFamilySelector(nat64PrefixSelector{prefix: rs.report.NAT64Prefix})
 	defer dc.Close()
 
 	// DialRegionTLS may dial multiple times if a node is not available, as such
@@ -1289,6 +1313,9 @@ func (c *Client) logConciseReport(r *Report, dm *tailcfg.DERPMap) {
 		}
 		if r.GlobalV6.IsValid() {
 			fmt.Fprintf(w, " v6a=%s", r.GlobalV6)
+		}
+		if r.NAT64Prefix.IsValid() {
+			fmt.Fprintf(w, " nat64=%v", r.NAT64Prefix)
 		}
 		if r.CaptivePortal != "" {
 			fmt.Fprintf(w, " captiveportal=%v", r.CaptivePortal)
@@ -1612,6 +1639,14 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 			return netip.AddrPortFrom(ip, uint16(port)), true
 		}
 	case probeIPv6:
+		if p, ok := c.currentNAT64Prefix(); ok && n.IPv4 != "" && n.IPv4 != "none" {
+			ip, _ := netip.ParseAddr(n.IPv4)
+			if ip.Is4() {
+				if synth, ok := nat64.Synthesize(p, ip); ok {
+					return netip.AddrPortFrom(synth, uint16(port)), true
+				}
+			}
+		}
 		if n.IPv6 != "" {
 			ip, _ := netip.ParseAddr(n.IPv6)
 			if !ip.Is6() {
@@ -1623,43 +1658,8 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 		return zero, false
 	}
 
-	// The default lookup function if we don't set UseDNSCache is to use net.DefaultResolver.
-	lookupIPAddr := func(ctx context.Context, host string) ([]netip.Addr, error) {
-		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
-		}
-
-		var naddrs []netip.Addr
-		for _, addr := range addrs {
-			na, ok := netip.AddrFromSlice(addr.IP)
-			if !ok {
-				continue
-			}
-			naddrs = append(naddrs, na.Unmap())
-		}
-		return naddrs, nil
-	}
-
-	c.mu.Lock()
-	if c.UseDNSCache {
-		if c.resolver == nil {
-			c.resolver = &dnscache.Resolver{
-				Forward:     net.DefaultResolver,
-				UseLastGood: true,
-				Logf:        c.logf,
-			}
-		}
-		resolver := c.resolver
-		lookupIPAddr = func(ctx context.Context, host string) ([]netip.Addr, error) {
-			_, _, allIPs, err := resolver.LookupIP(ctx, host)
-			return allIPs, err
-		}
-	}
-	c.mu.Unlock()
-
 	probeIsV4 := proto == probeIPv4
-	addrs, err := lookupIPAddr(ctx, n.HostName)
+	addrs, err := c.lookupIPAddr(ctx, n.HostName)
 	for _, a := range addrs {
 		if (a.Is4() && probeIsV4) || (a.Is6() && !probeIsV4) {
 			return netip.AddrPortFrom(a, uint16(port)), true
@@ -1669,6 +1669,80 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 		c.logf("netcheck: DNS lookup error for %q (node %q region %v): %v", n.HostName, n.Name, n.RegionID, err)
 	}
 	return zero, false
+}
+
+func (c *Client) discoverNAT64Prefix(ctx context.Context) (_ netip.Prefix, ok bool) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	addrs, err := c.lookupIPAddr(ctx, nat64.IPv4OnlyARPA)
+	if err != nil {
+		c.vlogf("netcheck: NAT64 prefix discovery failed: %v", err)
+		return netip.Prefix{}, false
+	}
+	prefix, ok := nat64.DiscoverPrefixFromAAAA(addrs)
+	if ok {
+		c.vlogf("netcheck: discovered NAT64 prefix %v", prefix)
+	}
+	return prefix, ok
+}
+
+func (c *Client) currentNAT64Prefix() (_ netip.Prefix, ok bool) {
+	c.mu.Lock()
+	rs := c.curState
+	c.mu.Unlock()
+	if rs == nil || !rs.report.NAT64Prefix.IsValid() {
+		return netip.Prefix{}, false
+	}
+	return rs.report.NAT64Prefix, true
+}
+
+func (c *Client) lookupIPAddr(ctx context.Context, host string) ([]netip.Addr, error) {
+	if c.LookupIPForTest != nil {
+		return c.LookupIPForTest(ctx, host)
+	}
+
+	c.mu.Lock()
+	useDNSCache := c.UseDNSCache
+	if useDNSCache && c.resolver == nil {
+		c.resolver = &dnscache.Resolver{
+			Forward:     net.DefaultResolver,
+			UseLastGood: true,
+			Logf:        c.logf,
+		}
+	}
+	resolver := c.resolver
+	c.mu.Unlock()
+
+	if useDNSCache {
+		_, _, allIPs, err := resolver.LookupIP(ctx, host)
+		return allIPs, err
+	}
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	var naddrs []netip.Addr
+	for _, addr := range addrs {
+		na, ok := netip.AddrFromSlice(addr.IP)
+		if !ok {
+			continue
+		}
+		naddrs = append(naddrs, na.Unmap())
+	}
+	return naddrs, nil
+}
+
+type nat64PrefixSelector struct {
+	prefix netip.Prefix
+}
+
+func (s nat64PrefixSelector) PreferIPv6() bool { return false }
+
+func (s nat64PrefixSelector) NAT64Prefix() (netip.Prefix, bool) {
+	return s.prefix, s.prefix.IsValid()
 }
 
 func regionHasDERPNode(r *tailcfg.DERPRegion) bool {
